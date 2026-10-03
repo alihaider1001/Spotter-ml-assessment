@@ -1,4 +1,9 @@
-"""Compare four regression models on a time-based freight-rate holdout."""
+"""Empirically compare linear and tree-based freight-rate regressors.
+
+The bake-off uses one fixed temporal holdout and one shared preprocessing path
+so the model choice reflects estimator behavior rather than inconsistent data
+preparation.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +34,16 @@ TRAIN_PATH = PROJECT_ROOT / "data" / "train-test.csv"
 def prepare_features(
     train_data: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """Clean, split, and ordinal-encode the training and holdout data."""
+    """Prepare leak-free model matrices for the historical and future periods.
+
+    ``OrdinalEncoder`` maps unseen locations to ``-1`` instead of raising an
+    error, which keeps the comparison representative of future production
+    inputs. The holdout uses ``transform`` only: fitting its vocabulary would
+    allow future information to influence training.
+    """
+    # A random split would make nearby market conditions appear in both sets
+    # and produce an optimistic estimate. Jan-Sep is training data; October is
+    # held out to simulate forecasting the next spot-market period.
     training_rows = train_data["date"] < CUTOFF_DATE
     holdout_rows = ~training_rows
 
@@ -42,6 +56,8 @@ def prepare_features(
         handle_unknown="use_encoded_value",
         unknown_value=-1,
     )
+    # Ridge, forests, and histogram boosting require numeric inputs, while the
+    # production data contains categorical locations and equipment labels.
     x_train[CATEGORICAL_COLUMNS] = encoder.fit_transform(
         x_train[CATEGORICAL_COLUMNS]
     )
@@ -53,7 +69,12 @@ def prepare_features(
 
 
 def build_models() -> dict[str, object]:
-    """Return the four models used in the empirical comparison."""
+    """Return the four models used in the empirical comparison.
+
+    Ridge establishes whether rate formation is adequately linear. The
+    ensemble models test whether nonlinear distance, seasonality, market, and
+    categorical interactions are needed to explain spot-market pricing.
+    """
     return {
         "Ridge": Ridge(),
         "Random Forest": RandomForestRegressor(
@@ -116,6 +137,8 @@ def main() -> None:
 
     results: list[dict[str, float | str]] = []
     for model_name, model in build_models().items():
+        # Timing fit plus inference captures the operational cost of selecting
+        # a model, not merely its offline accuracy on the holdout.
         start_time = time.perf_counter()
         model.fit(x_train, y_train)
         predictions = model.predict(x_holdout)

@@ -1,4 +1,10 @@
-"""Train a freight-rate model and generate the required prediction files."""
+"""Train the selected freight-rate model and generate submission artifacts.
+
+The pipeline intentionally mirrors the production constraints of the Spotter
+assessment: historical observations are separated from future observations by
+date, categorical vocabularies are learned only from training data, and the
+same fitted transformations are reused for every inference dataset.
+"""
 
 from __future__ import annotations
 
@@ -47,29 +53,40 @@ NUMERIC_COLUMNS = [
 def clean_and_engineer(df: pd.DataFrame) -> pd.DataFrame:
     """Clean raw load data and add calendar features.
 
-    The function returns a copy so callers can safely reuse the raw dataframe.
-    Missing numeric values are imputed with medians calculated from the input
-    dataframe, as required by the assessment specification.
+    A copy is returned so callers can safely reuse the raw dataframe. Median
+    values are calculated within each supplied dataset to preserve the
+    assessment's required behavior for training, validation, and chart inputs.
     """
     cleaned = df.copy()
 
     if "weight" in cleaned.columns:
+        # Negative freight weight is physically impossible; these values are
+        # intentional anomaly traps in the assessment data, not signed values.
         cleaned["weight"] = cleaned["weight"].abs()
+
+        # Freight weights are strongly right-skewed, so the median is less
+        # sensitive than the mean to unusually large transactional outliers.
         cleaned["weight"] = cleaned["weight"].fillna(cleaned["weight"].median())
 
     if "market_index" in cleaned.columns:
+        # The market index also contains outliers; robust median imputation
+        # prevents a small number of extreme rates from shifting replacements.
         cleaned["market_index"] = cleaned["market_index"].fillna(
             cleaned["market_index"].median()
         )
 
     if "date" in cleaned.columns:
         cleaned["date"] = pd.to_datetime(cleaned["date"], errors="raise")
+        # Calendar components expose recurring seasonality without asking the
+        # estimator to infer it from a raw timestamp representation.
         cleaned["month"] = cleaned["date"].dt.month.astype("int64")
         cleaned["day_of_week"] = cleaned["date"].dt.dayofweek.astype("int64")
         cleaned["day_of_month"] = cleaned["date"].dt.day.astype("int64")
 
     for column in CATEGORICAL_COLUMNS:
         if column in cleaned.columns:
+            # Category dtype preserves the location/equipment semantics until
+            # the model-specific encoder is fitted downstream.
             cleaned[column] = cleaned[column].astype("category")
 
     return cleaned
@@ -84,13 +101,15 @@ def align_inference_features(
 
     The December chart source intentionally contains only its seven original
     columns. For missing model inputs, use training medians; categorical levels
-    are aligned to the training categories so XGBoost receives a consistent
-    schema at prediction time.
+    are aligned to the training categories so every inference batch has a
+    consistent schema.
     """
     aligned = frame.copy()
 
     for column in NUMERIC_COLUMNS:
         if column not in aligned.columns:
+            # The chart input is deliberately sparse; training medians provide
+            # a stable fallback rather than inventing future market conditions.
             aligned[column] = numeric_defaults[column]
         aligned[column] = pd.to_numeric(aligned[column], errors="coerce").fillna(
             numeric_defaults[column]
@@ -99,6 +118,8 @@ def align_inference_features(
     for column in CATEGORICAL_COLUMNS:
         if column not in aligned.columns:
             aligned[column] = reference[column].cat.categories[0]
+        # Aligning levels before encoding prevents category-code drift between
+        # datasets and makes the inference contract deterministic.
         aligned[column] = pd.Categorical(
             aligned[column], categories=reference[column].cat.categories
         )
@@ -110,13 +131,20 @@ def encode_features(
     x_train: pd.DataFrame,
     x_other: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame, OrdinalEncoder]:
-    """Ordinal-encode categoricals using only the training categories."""
+    """Fit an unknown-safe encoder on training data and transform its peer set.
+
+    Unknown categories receive ``-1`` so a new city or equipment value in a
+    future data feed cannot crash the production job. The non-training frame is
+    transformed, never fitted, which prevents holdout vocabulary leakage.
+    """
     encoder = OrdinalEncoder(
         handle_unknown="use_encoded_value",
         unknown_value=-1,
     )
     encoded_train = x_train.copy()
     encoded_other = x_other.copy()
+    # Only historical training categories may define the feature mapping; the
+    # holdout must remain an unseen future-like sample during this operation.
     encoded_train[CATEGORICAL_COLUMNS] = encoder.fit_transform(
         encoded_train[CATEGORICAL_COLUMNS]
     )
@@ -130,7 +158,11 @@ def transform_features(
     frame: pd.DataFrame,
     encoder: OrdinalEncoder,
 ) -> pd.DataFrame:
-    """Apply the fitted categorical encoder to another feature frame."""
+    """Apply the already-fitted training encoder to an inference frame.
+
+    ``handle_unknown='use_encoded_value'`` and ``unknown_value=-1`` keep the
+    pipeline operational when future pickup or delivery cities are unseen.
+    """
     transformed = frame.copy()
     transformed[CATEGORICAL_COLUMNS] = encoder.transform(
         transformed[CATEGORICAL_COLUMNS]
@@ -139,7 +171,10 @@ def transform_features(
 
 
 def build_model() -> HistGradientBoostingRegressor:
-    """Create the tabular regression model used for all predictions."""
+    """Create the empirically selected model used for all predictions."""
+    # Model comparison showed that histogram binning handled the dataset's
+    # extreme transactional outliers and high-cardinality locations more
+    # efficiently than the tested standard XGBoost configuration.
     return HistGradientBoostingRegressor(
         max_iter=500,
         learning_rate=0.05,
@@ -153,6 +188,9 @@ def main() -> None:
     train_data = clean_and_engineer(pd.read_csv(TRAIN_PATH))
     train_data["date"] = pd.to_datetime(train_data["date"])
 
+    # A random train_test_split would leak neighboring time periods into both
+    # partitions. Training on Jan-Sep and holding out Oct better simulates the
+    # real forecasting task: predicting future spot-market rates.
     training_rows = train_data["date"] < CUTOFF_DATE
     internal_validation_rows = ~training_rows
     x_train = train_data.loc[training_rows, FEATURE_COLUMNS]
@@ -162,6 +200,9 @@ def main() -> None:
     ]
     y_internal_validation = train_data.loc[internal_validation_rows, TARGET]
     raw_x_train = x_train
+    # The encoder is fitted only on historical training rows. Its transform is
+    # reused for the holdout and later future datasets to prevent leakage and
+    # to tolerate completely new cities without failing the production job.
     x_train, x_internal_validation, encoder = encode_features(
         x_train, x_internal_validation
     )
