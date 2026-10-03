@@ -1,0 +1,137 @@
+"""Compare four regression models on a time-based freight-rate holdout."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import OrdinalEncoder
+
+from train_and_predict import (
+    CATEGORICAL_COLUMNS,
+    CUTOFF_DATE,
+    FEATURE_COLUMNS,
+    TARGET,
+    clean_and_engineer,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_PATH = PROJECT_ROOT / "data" / "train-test.csv"
+
+
+def prepare_features(
+    train_data: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+    """Clean, split, and ordinal-encode the training and holdout data."""
+    training_rows = train_data["date"] < CUTOFF_DATE
+    holdout_rows = ~training_rows
+
+    x_train = train_data.loc[training_rows, FEATURE_COLUMNS].copy()
+    y_train = train_data.loc[training_rows, TARGET]
+    x_holdout = train_data.loc[holdout_rows, FEATURE_COLUMNS].copy()
+    y_holdout = train_data.loc[holdout_rows, TARGET]
+
+    encoder = OrdinalEncoder(
+        handle_unknown="use_encoded_value",
+        unknown_value=-1,
+    )
+    x_train[CATEGORICAL_COLUMNS] = encoder.fit_transform(
+        x_train[CATEGORICAL_COLUMNS]
+    )
+    x_holdout[CATEGORICAL_COLUMNS] = encoder.transform(
+        x_holdout[CATEGORICAL_COLUMNS]
+    )
+
+    return x_train, y_train, x_holdout, y_holdout
+
+
+def build_models() -> dict[str, object]:
+    """Return the four models used in the empirical comparison."""
+    return {
+        "Ridge": Ridge(),
+        "Random Forest": RandomForestRegressor(
+            n_estimators=100,
+            n_jobs=-1,
+            random_state=42,
+        ),
+        "Hist. Gradient Boosting": HistGradientBoostingRegressor(
+            random_state=42,
+        ),
+        "XGBoost": xgb.XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=200,
+            learning_rate=0.05,
+            max_depth=6,
+            n_jobs=-1,
+            random_state=42,
+        ),
+    }
+
+
+def print_results(results: list[dict[str, float | str]]) -> None:
+    """Print comparison results as a readable ASCII table."""
+    headers = ["Model Name", "MAE ($)", "RMSE ($)", "Time (s)"]
+    rows = [
+        [
+            str(result["model"]),
+            f"{result['mae']:.2f}",
+            f"{result['rmse']:.2f}",
+            f"{result['time']:.2f}",
+        ]
+        for result in results
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+    separator = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+
+    print("\nModel Comparison on October Holdout")
+    print(separator)
+    header_values = [
+        header.ljust(widths[index]) for index, header in enumerate(headers)
+    ]
+    print("| " + " | ".join(header_values) + " |")
+    print(separator)
+    for row in rows:
+        row_values = [
+            value.ljust(widths[index]) for index, value in enumerate(row)
+        ]
+        print("| " + " | ".join(row_values) + " |")
+    print(separator)
+
+
+def main() -> None:
+    """Run the model bake-off and print holdout performance."""
+    data = clean_and_engineer(pd.read_csv(TRAIN_PATH))
+    data["date"] = pd.to_datetime(data["date"])
+    x_train, y_train, x_holdout, y_holdout = prepare_features(data)
+
+    results: list[dict[str, float | str]] = []
+    for model_name, model in build_models().items():
+        start_time = time.perf_counter()
+        model.fit(x_train, y_train)
+        predictions = model.predict(x_holdout)
+        elapsed_seconds = time.perf_counter() - start_time
+
+        results.append(
+            {
+                "model": model_name,
+                "mae": mean_absolute_error(y_holdout, predictions),
+                "rmse": np.sqrt(mean_squared_error(y_holdout, predictions)),
+                "time": elapsed_seconds,
+            }
+        )
+
+    print_results(results)
+
+
+if __name__ == "__main__":
+    main()
